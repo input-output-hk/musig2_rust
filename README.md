@@ -1,7 +1,7 @@
 # MuSig2 Rust Implementation 
 
 
-This is a MuSig2 implementation in rust, using the libsecp256k1 library for EC operations.
+This is a MuSig2 implementation in rust, using the blst library for EC operations.
 
 ----
 
