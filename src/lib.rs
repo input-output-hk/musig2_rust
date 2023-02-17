@@ -63,7 +63,7 @@ pub struct Signer {
     state: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
 /// Single signature
 pub struct Signature {
     /// signer's signature
@@ -197,7 +197,7 @@ impl Signer {
         R
     }
 
-    fn compute_c(pubkey: &Commitment, R: &Commitment, msg: &[u8]) -> Scalar {
+    pub(crate) fn compute_c(pubkey: &Commitment, R: &Commitment, msg: &[u8]) -> Scalar {
         let mut bytes: Vec<u8> = Vec::new();
         bytes.extend_from_slice(pubkey.compress().as_bytes());
         bytes.extend_from_slice(R.compress().as_bytes());
@@ -212,7 +212,7 @@ impl AggrSignature {
     pub fn aggregate (pubkey_list: &[Commitment], signatures: &[Signature]) -> Result<Self, AggrSignatureError> {
         for i in 1..signatures.len() {
             if signatures[i].R != signatures[0].R {
-                return Err(AggrSignatureError::NonceInvalid(signatures[i].R));
+                return Err(AggrSignatureError::NonceInvalid);
             }
         }
         let aggr_pubkey = Musig2Context::aggregate_pubkey(pubkey_list);
@@ -220,6 +220,17 @@ impl AggrSignature {
         let sig = Signature  { s: sum_sig, R: signatures[0].R};
 
         Ok(Self {sig, aggr_pubkey})
+    }
+    /// Verify aggregate signature of given message
+    pub fn verify (&self, msg: &[u8]) -> Result<(), AggrSignatureError> {
+        let c = Signer::compute_c(&self.aggr_pubkey, &self.sig.R, msg);
+        let lhs = &self.sig.s * &constants::RISTRETTO_BASEPOINT_TABLE;
+        let rhs = self.sig.R + self.aggr_pubkey * c;
+
+        if lhs != rhs {
+            return Err(AggrSignatureError::AggregateInvalid);
+        }
+        Ok(())
     }
 }
 
@@ -275,6 +286,9 @@ mod test {
             assert_eq!(signatures[0].R, signatures[i].R)
         }
 
-        assert!(AggrSignature::aggregate(&pubkey_list, &signatures).is_ok());
+        let aggr_sig = AggrSignature::aggregate(&pubkey_list, &signatures);
+        assert!(aggr_sig.is_ok());
+        assert!(AggrSignature::verify(&aggr_sig.unwrap(), MSG_1).is_ok());
+
     }
 }
