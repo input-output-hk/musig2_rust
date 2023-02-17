@@ -3,6 +3,11 @@
 #![warn(missing_docs, rust_2018_idioms)]
 #![allow(non_snake_case)]
 #![allow(dead_code)]
+
+mod errors;
+
+pub use crate::errors::{AggrSignatureError};
+
 use curve25519_dalek::constants;
 use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
@@ -12,11 +17,15 @@ use rand_core::{CryptoRng, RngCore};
 const NR_MESSAGES: usize = 2;
 const NONCE: usize = 2;
 
+/// Signer's commitment
+pub type Commitment = RistrettoPoint;
+
 /// The list of signer's commitments of size NONCE
 pub type RComms = [Commitment; NONCE];
 
 /// The list of signer's commitments for all messages to be signed
 pub type BatchedR = [RComms; NR_MESSAGES];
+
 
 #[derive(Debug, Default)]
 /// MuSig2 keypair
@@ -31,9 +40,6 @@ pub struct CommitmentWithOpening {
     msg: Scalar,
     comm: Commitment,
 }
-
-/// Signer's commitment
-pub type Commitment = RistrettoPoint;
 
 #[derive(Debug, Default, Clone)]
 /// MuSig2 context
@@ -59,42 +65,22 @@ pub struct Signer {
 
 #[derive(Debug, Default)]
 /// Single signature
-pub struct IndividualSignature {
+pub struct Signature {
     /// signer's signature
     pub s: Scalar,
     /// Commitment for the state
     pub R: Commitment,
 }
 
-impl Musig2Context {
-    fn set_L(&mut self, pubkey_list: &[RistrettoPoint]) {
-        let mut out: Vec<u8> = Vec::new();
-        for pk in pubkey_list {
-            out.extend_from_slice(pk.compress().as_bytes())
-        }
-        self.L = out;
-    }
-
-    fn aggregate_pubkey(&mut self, pubkey_list: &[RistrettoPoint]) {
-        self.aggr_pubkey = Default::default();
-        for pk in pubkey_list {
-            let mut temp_L = self.L.clone();
-            temp_L.extend_from_slice(pk.compress().as_bytes());
-            let a = Scalar::hash_from_bytes::<Sha512>(&temp_L);
-            self.aggr_pubkey += pk * a;
-        }
-    }
-
-    fn aggregate_R(&mut self, batch_list: &[BatchedR]) {
-        for signer_batch in batch_list {
-            for (i, batch) in signer_batch.iter().enumerate() {
-                for (j, comm) in batch.iter().enumerate() {
-                    self.aggr_R_list[i][j] += comm;
-                }
-            }
-        }
-    }
+#[derive(Debug, Default)]
+/// Aggregate signature
+pub struct AggrSignature {
+    /// aggregate signature
+    pub sig: Signature,
+    /// Aggregate pubkey for the state
+    pub aggr_pubkey: Commitment,
 }
+
 
 impl KeyPair {
     fn generate<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
@@ -109,6 +95,37 @@ impl CommitmentWithOpening {
         let msg = Scalar::random(rng);
         let comm = &msg * &constants::RISTRETTO_BASEPOINT_TABLE;
         Self { msg, comm }
+    }
+}
+
+impl Musig2Context {
+    fn set_L(pubkey_list: &[RistrettoPoint]) -> Vec<u8>{
+        let mut out: Vec<u8> = Vec::new();
+        for pk in pubkey_list {
+            out.extend_from_slice(pk.compress().as_bytes())
+        }
+        out
+    }
+
+    fn aggregate_pubkey(pubkey_list: &[RistrettoPoint]) -> Commitment {
+        let mut aggr_pubkey: Commitment = Default::default();
+        for pk in pubkey_list {
+            let mut temp_L = Musig2Context::set_L(pubkey_list);
+            temp_L.extend_from_slice(pk.compress().as_bytes());
+            let a = Scalar::hash_from_bytes::<Sha512>(&temp_L);
+            aggr_pubkey += pk * a;
+        }
+        aggr_pubkey
+    }
+
+    fn aggregate_R(&mut self, batch_list: &[BatchedR]) {
+        for signer_batch in batch_list {
+            for (i, batch) in signer_batch.iter().enumerate() {
+                for (j, comm) in batch.iter().enumerate() {
+                    self.aggr_R_list[i][j] += comm;
+                }
+            }
+        }
     }
 }
 
@@ -132,13 +149,13 @@ impl Signer {
     }
 
     /// The precomputation done before the actual signing process
-    pub fn precompute(&mut self, pubkey_list: &[RistrettoPoint], batch_list: &[BatchedR]) {
-        self.mc.aggregate_pubkey(pubkey_list);
+    pub fn precompute(&mut self, pubkey_list: &[Commitment], batch_list: &[BatchedR]) {
+        self.mc.aggr_pubkey = Musig2Context::aggregate_pubkey(pubkey_list);
         self.mc.aggregate_R(batch_list);
     }
 
     /// Single signature generation
-    pub fn sign(&mut self, msg: &[u8]) -> IndividualSignature {
+    pub fn sign(&mut self, msg: &[u8]) -> Signature {
         let mut temp_L = self.mc.L.clone();
         temp_L.extend_from_slice(self.keypair.pk.compress().as_bytes());
         let a = Scalar::hash_from_bytes::<Sha512>(&temp_L);
@@ -153,7 +170,7 @@ impl Signer {
             s += self.comm_list[self.state][index].msg * b;
         }
         self.state += 1;
-        IndividualSignature { s, R }
+        Signature { s, R }
     }
 
     fn compute_b(pubkey: &Commitment, batch: &RComms, msg: &[u8]) -> [Scalar; NONCE] {
@@ -189,6 +206,23 @@ impl Signer {
     }
 }
 
+impl AggrSignature {
+
+    /// Aggregate single signatures and corresponding public keys
+    pub fn aggregate (pubkey_list: &[Commitment], signatures: &[Signature]) -> Result<Self, AggrSignatureError> {
+        for i in 1..signatures.len() {
+            if signatures[i].R != signatures[0].R {
+                return Err(AggrSignatureError::NonceInvalid(signatures[i].R));
+            }
+        }
+        let aggr_pubkey = Musig2Context::aggregate_pubkey(pubkey_list);
+        let sum_sig = signatures.iter().map(| signature | signature.s).sum();
+        let sig = Signature  { s: sum_sig, R: signatures[0].R};
+
+        Ok(Self {sig, aggr_pubkey})
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -204,7 +238,7 @@ mod test {
         let mut signers: [Signer; NR_SIGNERS] = Default::default();
         let mut pubkey_list: [RistrettoPoint; NR_SIGNERS] = Default::default();
         let mut batch_list: [BatchedR; NR_SIGNERS] = Default::default();
-        let mut signatures: [IndividualSignature; NR_SIGNERS] = Default::default();
+        let mut signatures: [Signature; NR_SIGNERS] = Default::default();
 
         let mc = Musig2Context {
             aggr_pubkey: Default::default(),
@@ -227,6 +261,7 @@ mod test {
                 batch_list[cnt][i] = comms;
             }
         }
+
         for signer in signers.iter_mut() {
             signer.precompute(&pubkey_list, &batch_list);
         }
@@ -239,5 +274,7 @@ mod test {
         for i in 1..signatures.len() {
             assert_eq!(signatures[0].R, signatures[i].R)
         }
+
+        assert!(AggrSignature::aggregate(&pubkey_list, &signatures).is_ok());
     }
 }
